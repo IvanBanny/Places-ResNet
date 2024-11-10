@@ -1,5 +1,7 @@
+#!/usr/bin/env python3
 import os
 import csv
+import json
 from tqdm import tqdm
 import torch
 import argparse
@@ -134,6 +136,15 @@ def train(model, train_loader, val_loader, optimizer, criterion, device,
     # Place the model on device
     model = model.to(device)
 
+    # Define early stopping parameters
+    patience = 3  # Number of epochs to wait for improvement
+    best_val_accuracy = 0.0  # Best validation accuracy so far
+    epochs_without_improvement = 0  # Counter for epochs without improvement
+    best_model_state = None  # To store the state of the best model
+
+    # Performance tracking
+    performance = []
+
     for epoch in range(num_epochs):
         model.train()  # Set model to training mode
 
@@ -176,14 +187,44 @@ def train(model, train_loader, val_loader, optimizer, criterion, device,
                 pbar.set_postfix(loss=loss.item())
 
             # Calculate average loss and accuracy
-            avg_loss = running_loss / len(train_loader)
-            accuracy = correct_predictions / total_samples
+            avg_train_loss = running_loss / len(train_loader)
+            train_accuracy = correct_predictions / total_samples
+            avg_val_loss, val_accuracy = evaluate(model, val_loader, criterion, device)
 
-            avg_val_loss, val_accuracy  = evaluate(model, val_loader, criterion, device)
+            performance.append({
+                "avg_train_loss": avg_train_loss,
+                "train_accuracy": train_accuracy,
+                "avg_val_loss": avg_val_loss,
+                "val_accuracy": val_accuracy
+            })
             print(
-                f"Train Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f} "
+                f"Train Loss: {avg_train_loss:.4f}, Accuracy: {train_accuracy:.4f} "
                 f"Validation Loss: {avg_val_loss:.4f}, Validation Accuracy: {val_accuracy:.4f}"
             )
+
+            # Check for early stopping
+            if val_accuracy > best_val_accuracy:
+                best_val_accuracy = val_accuracy
+                epochs_without_improvement = 0  # Reset counter if there's an improvement
+
+                # Save the model checkpoint for the best model
+                best_model_state = {
+                    'model_state_dict': model.module.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'epoch': epoch,
+                }
+            else:
+                epochs_without_improvement += 1
+
+            # Early stopping condition
+            if epochs_without_improvement >= patience:
+                print(f"Early stopping at epoch {epoch + 1}.")
+                break  # Stop training if no improvement for 'patience' epochs
+
+    # Save the performance list to a JSON file
+    with open("performance.json", "w") as f:
+        json.dump(performance, f, indent=4)
+    torch.save(best_model_state, 'model.ckpt')
 
 
 def test(model, test_loader, device):
@@ -250,7 +291,7 @@ def main(args):
     # Create the dataloaders
 
     # Define the batch size and number of workers
-    batch_size = 64
+    batch_size = int(args.batch_size)
     num_workers = 2
 
     # Create DataLoader for training and validation sets
@@ -263,7 +304,7 @@ def main(args):
                             num_workers=num_workers,
                             shuffle=False)
 
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')  # TODO: check cuda
+    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else 'cpu')  # TODO: check cuda
 
     model = MyModel(num_classes=len(miniplaces_train.label_dict))
 
@@ -279,10 +320,7 @@ def main(args):
 
     if not args.test:
         train(model, train_loader, val_loader, optimizer, criterion,
-              device, num_epochs=25)
-
-        torch.save({'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict()}, 'model.ckpt')
+              device, num_epochs=int(args.epochs))
 
     else:
         miniplaces_test = MiniPlaces(data_root,
@@ -301,6 +339,9 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--test', action='store_true')
-    parser.add_argument('--checkpoint', default='model.ckpt')
+    parser.add_argument('--checkpoint')
+    parser.add_argument('--gpu', default=0)
+    parser.add_argument('--epochs', default=10)
+    parser.add_argument('--batch_size', default=32)
     args = parser.parse_args()
     main(args)
