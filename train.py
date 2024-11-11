@@ -9,6 +9,7 @@ from PIL import Image
 from torchvision import transforms
 from torch.utils.data import DataLoader, Dataset
 from model import MyModel
+import numpy as np
 
 
 class MiniPlaces(Dataset):
@@ -75,6 +76,47 @@ class MiniPlaces(Dataset):
         return image, label
 
 
+def create_train_transform():
+    """
+    Create training data transformation with augmentation
+    """
+    image_net_mean = torch.Tensor([0.485, 0.456, 0.406])
+    image_net_std = torch.Tensor([0.229, 0.224, 0.225])
+
+    return transforms.Compose([
+        transforms.RandomResizedCrop(128, scale=(0.8, 1.0)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ColorJitter(
+            brightness=0.4,
+            contrast=0.4,
+            saturation=0.4,
+            hue=0.1
+        ),
+        transforms.RandomAffine(
+            degrees=15,  # rotation
+            translate=(0.1, 0.1),  # horizontal/vertical translation
+            scale=(0.9, 1.1),  # scale
+        ),
+        transforms.ToTensor(),
+        transforms.Resize((128, 128)),
+        transforms.Normalize(image_net_mean, image_net_std)
+    ])
+
+
+def create_val_transform():
+    """
+    Create validation/test data transformation without augmentation
+    """
+    image_net_mean = torch.Tensor([0.485, 0.456, 0.406])
+    image_net_std = torch.Tensor([0.229, 0.224, 0.225])
+
+    return transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Resize((128, 128)),
+        transforms.Normalize(image_net_mean, image_net_std)
+    ])
+
+
 def evaluate(model, test_loader, criterion, device):
     """
     Evaluate the CNN classifier on the validation set.
@@ -137,7 +179,7 @@ def train(model, train_loader, val_loader, optimizer, criterion, device,
     model = model.to(device)
 
     # Define early stopping parameters
-    patience = 3  # Number of epochs to wait for improvement
+    patience = 5  # Number of epochs to wait for improvement
     best_val_accuracy = 0.0  # Best validation accuracy so far
     epochs_without_improvement = 0  # Counter for epochs without improvement
     best_model_state = None  # To store the state of the best model
@@ -277,9 +319,12 @@ def main(args):
         transforms.Normalize(image_net_mean, image_net_std),
     ])
 
-    data_root = 'data'
+    # Separate transforms for training and validation
+    train_transform = create_train_transform()
+    val_transform = create_val_transform()
 
-    # Create MiniPlaces dataset object
+    # Create datasets
+    data_root = 'data'
     miniplaces_train = MiniPlaces(data_root,
                                   split='train',
                                   transform=data_transform)
@@ -311,6 +356,8 @@ def main(args):
     # optimizer = torch.optim.Adam(model.parameters(), lr=0.001, betas=(0.9, 0.999), eps=1e-08, weight_decay=1e-4, amsgrad=False)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9, dampening=0, weight_decay=1e-4, nesterov=True)
 
+    print("PARAMS NUM:", sum(p.numel() for p in model.parameters() if p.requires_grad))
+
     if args.checkpoint:
         checkpoint = torch.load(args.checkpoint)
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -341,7 +388,7 @@ if __name__ == "__main__":
     parser.add_argument('--test', action='store_true')
     parser.add_argument('--checkpoint')
     parser.add_argument('--gpu', default=0)
-    parser.add_argument('--epochs', default=10)
+    parser.add_argument('--epochs', default=100)
     parser.add_argument('--batch_size', default=32)
     args = parser.parse_args()
     main(args)

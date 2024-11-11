@@ -34,9 +34,9 @@ class MyModel(nn.Module):
         self.pool1 = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
         # Residual blocks
-        self.layer1 = self._resnet_layers(64, 128, num_blocks=2)  # 2 residual blocks
-        self.layer2 = self._resnet_layers(128, 256, num_blocks=2)  # 2 residual blocks
-        self.layer3 = self._resnet_layers(256, 512, num_blocks=2)  # 2 residual blocks
+        self.block1 = self._resnet_layers(64, 128, num_blocks=3)  # 3 residual blocks
+        self.block2 = self._resnet_layers(128, 256, num_blocks=3)  # 3 residual blocks
+        self.block3 = self._resnet_layers(256, 512, num_blocks=3)  # 3 residual blocks
 
         # Global average pooling
         self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
@@ -47,9 +47,9 @@ class MyModel(nn.Module):
             self.bn1,
             nn.ReLU(),
             self.pool1,
-            self.layer1,
-            self.layer2,
-            self.layer3,
+            self.block1,
+            self.block2,
+            self.block3,
             self.global_avg_pool
         )
 

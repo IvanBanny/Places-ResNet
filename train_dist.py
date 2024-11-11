@@ -31,13 +31,14 @@ def setup(rank, world_size, port):
 
 def cleanup():
     """
-    Clean up the distributed training environment by destroying the process group.
+    Clean up distributed training environment
     """
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.barrier()  # Synchronize all processes before destroying process group
+        dist.destroy_process_group()
 
 
 class MiniPlaces(Dataset):
-    # Your existing MiniPlaces class implementation remains the same
     def __init__(self, root_dir, split, transform=None, label_dict=None):
         """
         Initialize the MiniPlaces dataset with the root directory for the images,
@@ -100,6 +101,47 @@ class MiniPlaces(Dataset):
         return image, label
 
 
+def create_train_transform():
+    """
+    Create training data transformation with augmentation
+    """
+    image_net_mean = torch.Tensor([0.485, 0.456, 0.406])
+    image_net_std = torch.Tensor([0.229, 0.224, 0.225])
+
+    return transforms.Compose([
+        transforms.RandomResizedCrop(128, scale=(0.8, 1.0)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ColorJitter(
+            brightness=0.4,
+            contrast=0.4,
+            saturation=0.4,
+            hue=0.1
+        ),
+        transforms.RandomAffine(
+            degrees=15,  # rotation
+            translate=(0.1, 0.1),  # horizontal/vertical translation
+            scale=(0.9, 1.1),  # scale
+        ),
+        transforms.ToTensor(),
+        transforms.Resize((128, 128)),
+        transforms.Normalize(image_net_mean, image_net_std)
+    ])
+
+
+def create_val_transform():
+    """
+    Create validation/test data transformation without augmentation
+    """
+    image_net_mean = torch.Tensor([0.485, 0.456, 0.406])
+    image_net_std = torch.Tensor([0.229, 0.224, 0.225])
+
+    return transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Resize((128, 128)),
+        transforms.Normalize(image_net_mean, image_net_std)
+    ])
+
+
 def evaluate(model, test_loader, criterion, device):
     """
     Evaluate the CNN classifier on the validation set.
@@ -158,146 +200,146 @@ def train_worker(rank, world_size, args):
         world_size (int): The total number of processes (GPUs).
         args (argparse.Namespace): Command-line arguments.
     """
-    setup(rank, world_size, args.port)
-    device = torch.device(f'cuda:{rank}')
+    try:
+        setup(rank, world_size, args.port)
+        device = torch.device(f'cuda:{rank}')
 
-    # Define early stopping parameters
-    patience = 3  # Number of epochs to wait for improvement
-    best_val_accuracy = 0.0  # Best validation accuracy so far
-    epochs_without_improvement = 0  # Counter for epochs without improvement
-    best_model_state = None  # To store the state of the best model
+        # Define early stopping parameters
+        patience = 3  # Number of epochs to wait for improvement
+        best_val_accuracy = 0.0  # Best validation accuracy so far
+        epochs_without_improvement = 0  # Counter for epochs without improvement
+        best_model_state = None  # To store the state of the best model
 
-    # Data loading and preprocessing
-    image_net_mean = torch.Tensor([0.485, 0.456, 0.406])
-    image_net_std = torch.Tensor([0.229, 0.224, 0.225])
-    data_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Resize((128, 128)),
-        transforms.Normalize(image_net_mean, image_net_std),
-    ])
+        # Separate transforms for training and validation
+        train_transform = create_train_transform()
+        val_transform = create_val_transform()
 
-    # Create datasets
-    data_root = 'data'
-    miniplaces_train = MiniPlaces(data_root, split='train', transform=data_transform)
-    miniplaces_val = MiniPlaces(data_root, split='val', transform=data_transform,
-                                label_dict=miniplaces_train.label_dict)
+        # Create datasets
+        data_root = 'data'
+        miniplaces_train = MiniPlaces(data_root, split='train', transform=train_transform)
+        miniplaces_val = MiniPlaces(data_root, split='val', transform=val_transform,
+                                    label_dict=miniplaces_train.label_dict)
 
-    # Create distributed samplers
-    train_sampler = DistributedSampler(miniplaces_train, num_replicas=world_size, rank=rank)
-    val_sampler = DistributedSampler(miniplaces_val, num_replicas=world_size, rank=rank)
+        # Create distributed samplers
+        train_sampler = DistributedSampler(miniplaces_train, num_replicas=world_size, rank=rank)
+        val_sampler = DistributedSampler(miniplaces_val, num_replicas=world_size, rank=rank)
 
-    # Create dataloaders
-    train_loader = DataLoader(miniplaces_train, batch_size=args.batch_size,
-                              num_workers=2, sampler=train_sampler,
-                              pin_memory=True)
-    val_loader = DataLoader(miniplaces_val, batch_size=args.batch_size,
-                            num_workers=2, sampler=val_sampler,
-                            pin_memory=True)
+        # Create dataloaders
+        train_loader = DataLoader(miniplaces_train, batch_size=args.batch_size,
+                                  num_workers=2, sampler=train_sampler,
+                                  pin_memory=True)
+        val_loader = DataLoader(miniplaces_val, batch_size=args.batch_size,
+                                num_workers=2, sampler=val_sampler,
+                                pin_memory=True)
 
-    # Create model and move to GPU
-    model = MyModel(num_classes=len(miniplaces_train.label_dict))
-    model = model.to(device)
-    model = DDP(model, device_ids=[rank])
+        # Create model and move to GPU
+        model = MyModel(num_classes=len(miniplaces_train.label_dict))
+        model = model.to(device)
+        model = DDP(model, device_ids=[rank])
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9,
-                                dampening=0, weight_decay=1e-4, nesterov=True)
-    criterion = torch.nn.CrossEntropyLoss(reduction='mean', label_smoothing=0.1)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9,
+                                    dampening=0, weight_decay=1e-4, nesterov=True)
+        criterion = torch.nn.CrossEntropyLoss(reduction='mean', label_smoothing=0.1)
 
-    if args.checkpoint:
-        map_location = {'cuda:%d' % 0: 'cuda:%d' % rank}
-        checkpoint = torch.load(args.checkpoint, map_location=map_location)
-        model.module.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if args.checkpoint:
+            map_location = {'cuda:%d' % 0: 'cuda:%d' % rank}
+            checkpoint = torch.load(args.checkpoint, map_location=map_location)
+            model.module.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
-    if not args.test:
-        # Training loop
-        performance = []
-        for epoch in range(args.epochs):
-            model.train()
-            train_sampler.set_epoch(epoch)  # Important for proper shuffling
+        if not args.test:
+            # Training loop
+            performance = []
+            for epoch in range(args.epochs):
+                model.train()
+                train_sampler.set_epoch(epoch)  # Important for proper shuffling
 
-            running_loss = 0.0
-            correct_predictions = 0
-            total_samples = 0
+                running_loss = 0.0
+                correct_predictions = 0
+                total_samples = 0
 
-            if rank == 0:  # Only show progress bar on rank 0
-                pbar = tqdm(total=len(train_loader),
-                            desc=f'Epoch {epoch + 1}/{args.epochs}',
-                            position=0, leave=True)
+                if rank == 0:  # Only show progress bar on rank 0
+                    pbar = tqdm(total=len(train_loader),
+                                desc=f'Epoch {epoch + 1}/{args.epochs}',
+                                position=0, leave=True)
 
-            for inputs, labels in train_loader:
-                inputs = inputs.to(device)
-                labels = labels.to(device)
+                for inputs, labels in train_loader:
+                    inputs = inputs.to(device)
+                    labels = labels.to(device)
 
-                optimizer.zero_grad()
-                logits = model(inputs)
-                loss = criterion(logits, labels)
-                loss.backward()
-                optimizer.step()
+                    optimizer.zero_grad()
+                    logits = model(inputs)
+                    loss = criterion(logits, labels)
+                    loss.backward()
+                    optimizer.step()
 
-                running_loss += loss.item()
-                _, predicted = logits.max(1)
-                correct_predictions += (predicted == labels).sum().item()
-                total_samples += labels.size(0)
+                    running_loss += loss.item()
+                    _, predicted = logits.max(1)
+                    correct_predictions += (predicted == labels).sum().item()
+                    total_samples += labels.size(0)
+
+                    if rank == 0:
+                        pbar.update(1)
+                        pbar.set_postfix(loss=loss.item())
 
                 if rank == 0:
-                    pbar.update(1)
-                    pbar.set_postfix(loss=loss.item())
+                    pbar.close()
 
-            if rank == 0:
-                pbar.close()
+                # Evaluate and log metrics
+                avg_train_loss = running_loss / len(train_loader)
+                train_accuracy = correct_predictions / total_samples
+                avg_val_loss, val_accuracy = evaluate(model, val_loader, criterion, device)
 
-            # Evaluate and log metrics
-            avg_train_loss = running_loss / len(train_loader)
-            train_accuracy = correct_predictions / total_samples
-            avg_val_loss, val_accuracy = evaluate(model, val_loader, criterion, device)
+                if rank == 0:  # Only save metrics on rank 0
+                    performance.append({
+                        "avg_train_loss": avg_train_loss,
+                        "train_accuracy": train_accuracy,
+                        "avg_val_loss": avg_val_loss,
+                        "val_accuracy": val_accuracy
+                    })
+                    print(
+                        f"Train Loss: {avg_train_loss:.4f}, Accuracy: {train_accuracy:.4f} "
+                        f"Validation Loss: {avg_val_loss:.4f}, Validation Accuracy: {val_accuracy:.4f}"
+                    )
 
-            if rank == 0:  # Only save metrics on rank 0
-                performance.append({
-                    "avg_train_loss": avg_train_loss,
-                    "train_accuracy": train_accuracy,
-                    "avg_val_loss": avg_val_loss,
-                    "val_accuracy": val_accuracy
-                })
-                print(
-                    f"Train Loss: {avg_train_loss:.4f}, Accuracy: {train_accuracy:.4f} "
-                    f"Validation Loss: {avg_val_loss:.4f}, Validation Accuracy: {val_accuracy:.4f}"
-                )
+                    # Check for early stopping
+                    if val_accuracy > best_val_accuracy:
+                        best_val_accuracy = val_accuracy
+                        epochs_without_improvement = 0  # Reset counter if there's an improvement
 
-                # Check for early stopping
-                if val_accuracy > best_val_accuracy:
-                    best_val_accuracy = val_accuracy
-                    epochs_without_improvement = 0  # Reset counter if there's an improvement
+                        # Save the model checkpoint for the best model
+                        best_model_state = {
+                            'model_state_dict': model.module.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'epoch': epoch,
+                        }
+                    else:
+                        epochs_without_improvement += 1
 
-                    # Save the model checkpoint for the best model
-                    best_model_state = {
-                        'model_state_dict': model.module.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'epoch': epoch,
-                    }
-                else:
-                    epochs_without_improvement += 1
+                    # Early stopping condition
+                    if epochs_without_improvement >= patience:
+                        print(f"Early stopping at epoch {epoch + 1}.")
+                        break  # Stop training if no improvement for 'patience' epochs
 
-                # Early stopping condition
-                if epochs_without_improvement >= patience:
-                    print(f"Early stopping at epoch {epoch + 1}.")
-                    break  # Stop training if no improvement for 'patience' epochs
+            if rank == 0:  # Save performance and the best model checkpoint only on rank 0
+                with open("performance.json", "w") as f:
+                    json.dump(performance, f, indent=4)
+                torch.save(best_model_state, 'model.ckpt')
 
-        if rank == 0:  # Save performance and the best model checkpoint only on rank 0
-            with open("performance.json", "w") as f:
-                json.dump(performance, f, indent=4)
-            torch.save(best_model_state, 'model.ckpt')
-
-    else:  # Testing mode
-        miniplaces_test = MiniPlaces(data_root, split='test', transform=data_transform)
-        test_loader = DataLoader(miniplaces_test, batch_size=args.batch_size, num_workers=2, shuffle=False)
-        checkpoint = torch.load(args.checkpoint, map_location=device)
-        model.module.load_state_dict(checkpoint['model_state_dict'])
-        preds = test(model, test_loader, device)
-        if rank == 0:  # Only write predictions on rank 0
-            write_predictions(preds, 'predictions.csv')
-
-    cleanup()
+        else:  # Testing mode
+            miniplaces_test = MiniPlaces(data_root, split='test', transform=data_transform)
+            test_loader = DataLoader(miniplaces_test, batch_size=args.batch_size, num_workers=2, shuffle=False)
+            checkpoint = torch.load(args.checkpoint, map_location=device)
+            model.module.load_state_dict(checkpoint['model_state_dict'])
+            preds = test(model, test_loader, device)
+            if rank == 0:  # Only write predictions on rank 0
+                write_predictions(preds, 'predictions.csv')
+    finally:
+        cleanup()
+        # Add explicit synchronization before exiting
+        torch.cuda.synchronize()
+        if dist.is_initialized():
+            dist.barrier()
 
 
 def test(model, test_loader, device):
@@ -345,20 +387,23 @@ def main(args):
     Args:
         args (argparse.Namespace): Command-line arguments.
     """
-    # Get number of available GPUs
     world_size = torch.cuda.device_count()
-    mp.spawn(train_worker,
-             args=(world_size, args),
-             nprocs=world_size,
-             join=True)
+    try:
+        mp.spawn(train_worker,
+                 args=(world_size, args),
+                 nprocs=world_size,
+                 join=True)
+    finally:
+        # Force cleanup of any remaining CUDA resources
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--test', action='store_true')
     parser.add_argument('--checkpoint')
-    parser.add_argument('--epochs', type=int, default=10)
-    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--port', type=int, default=4224)
     args = parser.parse_args()
     main(args)
