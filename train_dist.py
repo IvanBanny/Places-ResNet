@@ -255,9 +255,9 @@ def train_worker(rank, world_size, args):
                                     dampening=0, weight_decay=1e-4, nesterov=True)
         criterion = torch.nn.CrossEntropyLoss(reduction='mean', label_smoothing=0.1)
 
-        if args.checkpoint:
+        if args.checkpoint or args.test:
             map_location = {'cuda:%d' % 0: 'cuda:%d' % rank}
-            checkpoint = torch.load(args.checkpoint, map_location=map_location)
+            checkpoint = torch.load((args.checkpoint if args.checkpoint else 'model.ckpt'), map_location=map_location)
             model.module.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
@@ -359,8 +359,6 @@ def train_worker(rank, world_size, args):
 
             miniplaces_test = MiniPlaces(data_root, split='test', transform=val_transform)
             test_loader = DataLoader(miniplaces_test, batch_size=args.batch_size, num_workers=2, shuffle=False)
-            checkpoint = torch.load(args.checkpoint, map_location=device)
-            model.module.load_state_dict(checkpoint['model_state_dict'])
 
             preds = test(model, test_loader, device)
             if rank == 0:  # Only write predictions on rank 0
@@ -435,7 +433,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--test', action='store_true')
     parser.add_argument('--checkpoint')
-    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--port', type=int, default=4224)
     args = parser.parse_args()
