@@ -6,8 +6,6 @@ My experiment training a ResNet-inspired model for image classification using Py
 
 Training time was approximately 10 hours (108 epochs) using **distributed training** across university server GPUs.
 
-The trained model.ckpt is available at https://huggingface.co/IvanBanny/MiniPlaces-ResNet-13.
-
 ## Dataset:
 
 **MIT MiniPlaces Dataset:** Contains 100,000 training images, 10,000 validation images, and 10,000 testing images across 100 scene categories. Each image is 128x128 pixels.
