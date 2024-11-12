@@ -2,11 +2,13 @@
 import os
 import csv
 import json
+import warnings
 from tqdm import tqdm
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data.distributed import DistributedSampler
 import argparse
 from PIL import Image
@@ -36,6 +38,7 @@ def cleanup():
     if dist.is_initialized():
         dist.barrier()  # Synchronize all processes before destroying process group
         dist.destroy_process_group()
+        torch.cuda.synchronize()
 
 
 class MiniPlaces(Dataset):
@@ -161,6 +164,7 @@ def evaluate(model, test_loader, criterion, device):
     with torch.no_grad():
         total_loss = 0.0
         num_correct = 0
+        num_correct_top5 = 0
         num_samples = 0
 
         for inputs, labels in test_loader:
@@ -173,22 +177,29 @@ def evaluate(model, test_loader, criterion, device):
 
             _, predictions = torch.max(logits, dim=1)
             num_correct += (predictions == labels).sum().item()
+
+            _, top5_predictions = torch.topk(logits, 5, dim=1)
+            num_correct_top5 += (top5_predictions == labels.unsqueeze(1)).any(dim=1).sum().item()
+
             num_samples += len(inputs)
 
         # Gather metrics from all processes
         world_size = dist.get_world_size()
         total_loss = torch.tensor(total_loss).to(device)
         num_correct = torch.tensor(num_correct).to(device)
+        num_correct_top5 = torch.tensor(num_correct_top5).to(device)
         num_samples = torch.tensor(num_samples).to(device)
 
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(num_correct, op=dist.ReduceOp.SUM)
+        dist.all_reduce(num_correct_top5, op=dist.ReduceOp.SUM)
         dist.all_reduce(num_samples, op=dist.ReduceOp.SUM)
 
         avg_loss = (total_loss / world_size).item() / len(test_loader)
         accuracy = (num_correct / num_samples).item()
+        top5_accuracy = (num_correct_top5 / num_samples).item()
 
-    return avg_loss, accuracy
+    return avg_loss, accuracy, top5_accuracy
 
 
 def train_worker(rank, world_size, args):
@@ -201,14 +212,17 @@ def train_worker(rank, world_size, args):
         args (argparse.Namespace): Command-line arguments.
     """
     try:
+        warnings.filterwarnings("ignore")
         setup(rank, world_size, args.port)
         device = torch.device(f'cuda:{rank}')
 
         # Define early stopping parameters
-        patience = 3  # Number of epochs to wait for improvement
+        patience = 10  # Number of epochs to wait for improvement
         best_val_accuracy = 0.0  # Best validation accuracy so far
         epochs_without_improvement = 0  # Counter for epochs without improvement
         best_model_state = None  # To store the state of the best model
+
+        last_lr = 0
 
         # Separate transforms for training and validation
         train_transform = create_train_transform()
@@ -233,7 +247,7 @@ def train_worker(rank, world_size, args):
                                 pin_memory=True)
 
         # Create model and move to GPU
-        model = MyModel(num_classes=len(miniplaces_train.label_dict))
+        model = MyModel(num_classes=len(miniplaces_train.label_dict), dropout_rate=0.2)
         model = model.to(device)
         model = DDP(model, device_ids=[rank])
 
@@ -246,6 +260,9 @@ def train_worker(rank, world_size, args):
             checkpoint = torch.load(args.checkpoint, map_location=map_location)
             model.module.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        # Initialize the ReduceLROnPlateau scheduler
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=4)
 
         if not args.test:
             # Training loop
@@ -288,7 +305,14 @@ def train_worker(rank, world_size, args):
                 # Evaluate and log metrics
                 avg_train_loss = running_loss / len(train_loader)
                 train_accuracy = correct_predictions / total_samples
-                avg_val_loss, val_accuracy = evaluate(model, val_loader, criterion, device)
+                avg_val_loss, val_accuracy, val_top5_accuracy = evaluate(model, val_loader, criterion, device)
+
+                # Step the scheduler with the validation loss
+                scheduler.step(avg_val_loss)
+                if scheduler.get_last_lr()[0] != last_lr:
+                    last_lr = scheduler.get_last_lr()[0]
+                    if epoch != 0:
+                        print(f"New learning rate: {scheduler.get_last_lr()[0]}")
 
                 if rank == 0:  # Only save metrics on rank 0
                     performance.append({
@@ -327,16 +351,25 @@ def train_worker(rank, world_size, args):
                 torch.save(best_model_state, 'model.ckpt')
 
         else:  # Testing mode
-            miniplaces_test = MiniPlaces(data_root, split='test', transform=data_transform)
+            avg_val_loss, val_accuracy, val_top5_accuracy = evaluate(model, val_loader, criterion, device)
+            if rank == 0:
+                print(f"\nValidation Loss: {avg_val_loss:.4f}\n"
+                      f"Validation Accuracy: {val_accuracy:.4f}\n"
+                      f"Validation Top-5 Accuracy: {val_top5_accuracy:.4f}\n")
+
+            miniplaces_test = MiniPlaces(data_root, split='test', transform=val_transform)
             test_loader = DataLoader(miniplaces_test, batch_size=args.batch_size, num_workers=2, shuffle=False)
             checkpoint = torch.load(args.checkpoint, map_location=device)
             model.module.load_state_dict(checkpoint['model_state_dict'])
+
             preds = test(model, test_loader, device)
             if rank == 0:  # Only write predictions on rank 0
                 write_predictions(preds, 'predictions.csv')
+                print("Predictions saved to predictions.csv\n")
+
     finally:
         cleanup()
-        # Add explicit synchronization before exiting
+        # Explicit synchronization before exiting
         torch.cuda.synchronize()
         if dist.is_initialized():
             dist.barrier()
@@ -403,7 +436,7 @@ if __name__ == "__main__":
     parser.add_argument('--test', action='store_true')
     parser.add_argument('--checkpoint')
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--port', type=int, default=4224)
     args = parser.parse_args()
     main(args)
